@@ -319,11 +319,9 @@ void RadarLayer::predictiveCost(
   double x_x, x_y, y_x, y_y;
   double inv_x_x, inv_x_y, inv_y_x, inv_y_y;
 
-  auto clk = clock_->get_clock_type();
-  rclcpp::Time stamp(obstacle_array->header.stamp, clk);
   getTransformCoefficients(
-    global_frame_, obstacle_array->header.frame_id, stamp,
-    dx, dy, x_x, x_y, y_x, y_y, inv_x_x, inv_x_y, inv_y_x, inv_y_y);
+    global_frame_, obstacle_array->header.frame_id, dx, dy, x_x, x_y, y_x,
+    y_y, inv_x_x, inv_x_y, inv_y_x, inv_y_y);
 
   const double eps = 1e-9; // 수치 안전 마진
 
@@ -645,11 +643,9 @@ void RadarLayer::stampFootprint(
   double inv_y_x;
   double inv_y_y;
 
-  auto clk = clock_->get_clock_type();
-  rclcpp::Time stamp(obstacle_array->header.stamp, clk);
   getTransformCoefficients(
-    global_frame_, obstacle_array->header.frame_id, stamp,
-    dx, dy, x_x, x_y, y_x, y_y, inv_x_x, inv_x_y, inv_y_x, inv_y_y);
+    global_frame_, obstacle_array->header.frame_id, dx, dy, x_x, x_y, y_x,
+    y_y, inv_x_x, inv_x_y, inv_y_x, inv_y_y);
 
   for (size_t i = 0; i < number_of_objects; i++) {
     double length = obstacle_array->obstacles[i].size.x;
@@ -699,45 +695,13 @@ void RadarLayer::stampFootprint(
 
 void RadarLayer::getTransformCoefficients(
   std::string source_frame,
-  std::string target_frame,
-  const rclcpp::Time & stamp,
-  double & dx, double & dy, double & x_x, double & x_y, double & y_x,
+  std::string target_frame, double & dx, double & dy, double & x_x, double & x_y, double & y_x,
   double & y_y, double & inv_x_x, double & inv_x_y, double & inv_y_x, double & inv_y_y)
 {
-  // 동일 프레임이면 항등
-  if (source_frame == target_frame) {
-    dx = 0.0; dy = 0.0;
-    x_x = 1.0; x_y = 0.0;
-    y_x = 0.0; y_y = 1.0;
-    inv_x_x = 1.0; inv_x_y = 0.0;
-    inv_y_x = 0.0; inv_y_y = 1.0;
-    return;
-  }
-
   geometry_msgs::msg::TransformStamped transform;
-
-  try {
-    // ★ 메시지 시각으로 TF 조회 (최대 0.3s 대기)
-    transform = tf_->lookupTransform(
-      source_frame, target_frame, stamp, rclcpp::Duration::from_seconds(0.3));
-  } catch (tf2::TransformException & ex) {
-    // 마지막 수단: 최신 TF로라도 시도 (짧게 대기)
-    try {
-      transform = tf_->lookupTransform(
-        source_frame, target_frame, rclcpp::Time(0, 0, stamp.get_clock_type()),
-        rclcpp::Duration::from_seconds(0.1));
-    } catch (tf2::TransformException & ex2) {
-      RCLCPP_ERROR(logger_, "TF lookup failed (%s->%s): %s / fallback: %s",
-                   source_frame.c_str(), target_frame.c_str(), ex.what(), ex2.what());
-      // 실패 시 항등으로 반환 (보수적)
-      dx = 0.0; dy = 0.0;
-      x_x = 1.0; x_y = 0.0;
-      y_x = 0.0; y_y = 1.0;
-      inv_x_x = 1.0; inv_x_y = 0.0;
-      inv_y_x = 0.0; inv_y_y = 1.0;
-      return;
-    }
-  }
+  transform = tf_->lookupTransform(
+    source_frame, target_frame,
+    clock_->now(), rclcpp::Duration::from_seconds(2.0));
 
   tf2::Quaternion q(
     transform.transform.rotation.x,
@@ -749,17 +713,18 @@ void RadarLayer::getTransformCoefficients(
   double roll, pitch, yaw;
   m.getRPY(roll, pitch, yaw);
 
-  const double cos_yaw = std::cos(yaw);
-  const double sin_yaw = std::sin(yaw);
-  const double cos_pitch = std::cos(pitch);
-  const double sin_pitch = std::sin(pitch);
   const double cos_roll = std::cos(roll);
   const double sin_roll = std::sin(roll);
+
+  const double cos_pitch = std::cos(pitch);
+  const double sin_pitch = std::sin(pitch);
+
+  const double cos_yaw = std::cos(yaw);
+  const double sin_yaw = std::sin(yaw);
 
   dx = transform.transform.translation.x;
   dy = transform.transform.translation.y;
 
-  // 원래 코드의 2D 투영 계수 유지
   x_x = cos_yaw * cos_pitch;
   x_y = sin_yaw * cos_pitch;
 

@@ -288,6 +288,7 @@ public:
   void getTransformCoefficients(
     std::string source_frame,
     std::string target_frame,
+    const rclcpp::Time & stamp,
     double & dx,
     double & dy,
     double & x_x,

@@ -2,21 +2,21 @@ costmap:
   costmap:
     ros__parameters:
 
-      footprint: "[[-1.0,-0.3],[-1.0,0.3],[3.5,0.3],[3.5,-0.3]]"
+      footprint: "[[-0.3,-0.3],[-0.3,0.3],[0.3,0.3],[0.3,-0.3]]"
       footprint_padding: 0.0
-      transform_tolerance: 2.0
+      transform_tolerance: 0.5
 
       update_frequency: 20.0
       publish_frequency: 10.0
 
-      global_frame: odom
-      robot_base_frame: base_link
+      global_frame: map
+      robot_base_frame: zed_camera_link
 
       width: 100
       height: 100
       origin_x: -50.0
       origin_y: -50.0
-      resolution: 0.2
+      resolution: 0.05
       rolling_window: true
 
       track_unknown_space: false
@@ -25,13 +25,29 @@ costmap:
 
       plugins: ["radar_layer"]
 
+      # radar_layer:
+      #   plugin: "radar_layer/RadarLayer"
+      #   enabled: True
+      #   combination_method: 1          # Max
+      #   stamp_footprint: false         # ★ predictive 모드 켬
+      #   number_of_time_steps: 5       # 시간 전개 스텝 수 (늘릴수록 길게)
+      #   sample_time: 0.1               # 스텝 간격(초) → 15*0.15=2.25s 가시화
+      #   minimum_probability: 0.05     # 임계값 낮추면 퍼짐이 커짐
+      #   observation_sources: "radar"
+      #   radar:
+      #     topic: /tracking
+
       radar_layer:
         plugin: "radar_layer/RadarLayer"
         enabled: True
-        number_of_time_steps: 10
-        sample_time: 0.1
-        minimum_probability: 0.15
+        combination_method: 1           # Max
+        stamp_footprint: false          # ★ predictive 모드 켬
+        number_of_time_steps: 5         # 시간 전개 스텝 수 (늘릴수록 길게)
+        sample_time: 0.1                # 스텝 간격(초) → 15*0.15=2.25s 가시화
+        minimum_probability: 0.2        # 임계값 낮추면 퍼짐이 커짐
+        covariance_scaling_factor: 1.0    # costmap 강도 결정 float    
         observation_sources: "radar"
+        observation_ttl: 4.0            # 입력 없을 때 버퍼 비우는 TTL(초)
         radar:
           topic: /tracking
 

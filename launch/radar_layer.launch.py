@@ -50,7 +50,7 @@ def generate_launch_description():
 
     # Add actions
     ld = LaunchDescription([
-      tf_node,
+      # tf_node,
       nav2_lifecycle_manager,
       nav2_costmap_path_arg,
       nav2_2d_costmap
