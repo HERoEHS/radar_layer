@@ -23,6 +23,18 @@ using rcl_interfaces::msg::ParameterType;
 
 namespace radar_layer
 {
+  
+// 공분산과 최소확률 임계치로 "축 방향 지름(미터)" 계산
+// ratio = s0 / s (초기/현재 정규화 항) — 단순화하려면 1.0로 둬도 됨
+static inline double axis_extent_m(double cov_ii, double p_min, double ratio = 1.0) {
+  p_min = std::min(std::max(p_min, 1e-6), 0.999999);
+  ratio = std::max(ratio, 1e-9);
+  double inner = -2.0 * (std::log(p_min) - std::log(ratio)) * cov_ii;
+  if (!std::isfinite(inner) || inner <= 0.0) return 0.0;
+  // 반환은 "지름"(= 반경*2)
+  return 2.0 * std::sqrt(inner);
+}
+
 /**
    * @class RadarLayer
    * @brief Takes in radar data to populate into 2D costmap
@@ -361,6 +373,11 @@ public:
     double & sqrt_2_pi_det_covariance_0);
 
   rmw_time_t convertHzToRmwTimeS(double qos_deadline_hz);
+  
+  void predictiveCostSeeded(
+  nav2_dynamic_msgs::msg::ObstacleArray::SharedPtr obstacles,     // 트래킹
+  nav2_dynamic_msgs::msg::ObstacleArray::SharedPtr detections,    // 검출
+  int number_of_objects);
 
 private:
   /// @brief Used to store observations from radar sensors

@@ -25,15 +25,27 @@ costmap:
 
       plugins: ["radar_layer"]
 
+      # radar_layer:
+      #   plugin: "radar_layer/RadarLayer"
+      #   enabled: True
+      #   combination_method: 1          # Max
+      #   stamp_footprint: false         # ★ predictive 모드 켬
+      #   number_of_time_steps: 5       # 시간 전개 스텝 수 (늘릴수록 길게)
+      #   sample_time: 0.1               # 스텝 간격(초) → 15*0.15=2.25s 가시화
+      #   minimum_probability: 0.05     # 임계값 낮추면 퍼짐이 커짐
+      #   observation_sources: "radar"
+      #   radar:
+      #     topic: /tracking
+
       radar_layer:
         plugin: "radar_layer/RadarLayer"
         enabled: True
         combination_method: 1           # Max
         stamp_footprint: false          # ★ predictive 모드 켬
-        number_of_time_steps: 3       # 시간 전개 스텝 수 (늘릴수록 길게)
-        sample_time: 0.1                # 스텝 간격(초) → 15*0.15=2.25s 가시화
-        minimum_probability: 0.3      # 임계값 낮추면 퍼짐이 커짐
-        covariance_scaling_factor: 0.5    # costmap 강도 결정 float    
+        number_of_time_steps: 5       # 시간 전개 스텝 수 (늘릴수록 길게)
+        sample_time: 0.2                # 스텝 간격(초) → 15*0.15=2.25s 가시화
+        minimum_probability: 0.03      # 임계값 낮추면 퍼짐이 커짐
+        covariance_scaling_factor: 1.0    # costmap 강도 결정 float    
         observation_sources: "radar"
         observation_ttl: 3.0            # 입력 없을 때 버퍼 비우는 TTL(초)
         radar:

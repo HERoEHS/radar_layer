@@ -31,6 +31,7 @@ void RadarLayer::onInitialize()
   declareParameter("minimum_probability", rclcpp::ParameterValue(0.01));
   declareParameter("number_of_time_steps", rclcpp::ParameterValue(1));
   declareParameter("sample_time", rclcpp::ParameterValue(0.1));
+  declareParameter("max_prediction_speed", rclcpp::ParameterValue(2.0));  // m/s
   declareParameter("stamp_footprint", rclcpp::ParameterValue(true));
   declareParameter("covariance_scaling_factor", rclcpp::ParameterValue(1.0));
   // ★ 추가: 입력 무소식 시 버퍼 비우는 TTL(초)
@@ -112,13 +113,8 @@ void RadarLayer::onInitialize()
 
 
 void RadarLayer::updateBounds(
-  double robot_x,
-  double robot_y,
-  double robot_yaw,
-  double * min_x,
-  double * min_y,
-  double * max_x,
-  double * max_y)
+  double robot_x, double robot_y, double robot_yaw,
+  double* min_x, double* min_y, double* max_x, double* max_y)
 {
   std::lock_guard<Costmap2D::mutex_t> guard(*getMutex());
   resetMaps();
@@ -127,49 +123,44 @@ void RadarLayer::updateBounds(
     updateOrigin(robot_x - getSizeInMetersX() / 2, robot_y - getSizeInMetersY() / 2);
   }
 
-  // 레이어 전체를 바운딩
   touch(max_bound, max_bound, min_x, min_y, max_x, max_y);
   touch(min_bound, min_bound, min_x, min_y, max_x, max_y);
 
-  // ★ TTL 파라미터
+  // TTL
   double ttl_sec = 0.8;
-  if (auto node = node_.lock()) {
-    node->get_parameter(name_ + "." + "observation_ttl", ttl_sec);
-  }
+  if (auto node = node_.lock()) node->get_parameter(name_ + "." + "observation_ttl", ttl_sec);
   const rclcpp::Duration ttl = rclcpp::Duration::from_seconds(std::max(0.05, ttl_sec));
 
-  // ★ now는 costmap 노드의 clock 타입
-  const rclcpp::Time now = clock_->now();
-  const auto now_clock = clock_->get_clock_type();
+  const auto now   = clock_->now();
+  const auto ctype = clock_->get_clock_type();
 
-  for (auto it = obstacle_buffers_.begin(); it != obstacle_buffers_.end(); ++it) {
-    auto & obstacle_array = *it;
+  // ★ 검출/트래킹 버퍼를 같은 인덱스로 함께 순회
+  for (size_t s = 0; s < obstacle_buffers_.size(); ++s) {
+    auto& obs_arr = obstacle_buffers_[s];
+    auto& det_arr = detection_buffers_[s];
 
-    // ★ 헤더 stamp도 동일한 clock 타입으로 생성
-    const rclcpp::Time stamp(obstacle_array->header.stamp, now_clock);
-    const bool no_stamp = (obstacle_array->header.stamp.sec == 0 &&
-                           obstacle_array->header.stamp.nanosec == 0);
+    // 유효성(TTL) 체크: 트래킹 기준으로 우선 판단
+    const rclcpp::Time obs_stamp(obs_arr->header.stamp, ctype);
+    const bool obs_empty  = (obs_arr->obstacles.empty());
+    const bool obs_stale  = (obs_arr->header.stamp.sec == 0 && obs_arr->header.stamp.nanosec == 0)
+                            || ((now - obs_stamp) > ttl);
 
-    if (no_stamp || (now - stamp) > ttl) {
-      // 입력 끊긴 소스 → 버퍼 비우고 스킵
-      obstacle_array->obstacles.clear();
+    if (obs_empty || obs_stale) {
+      obs_arr->obstacles.clear();
       continue;
     }
 
-    const int number_of_objects = static_cast<int>(obstacle_array->obstacles.size());
-    if (number_of_objects <= 0) {
-      continue;
-    }
+    const int n_objs = static_cast<int>(obs_arr->obstacles.size());
+    if (n_objs <= 0) continue;
 
     if (stamp_footprint_) {
-      stampFootprint(obstacle_array, number_of_objects);
+      stampFootprint(obs_arr, n_objs);
     } else {
-      predictiveCost(obstacle_array, number_of_objects);
+      // ★ 씨앗은 "검출", 퍼짐은 "트래킹"을 사용
+      predictiveCostSeeded(obs_arr, det_arr, n_objs);
     }
   }
 }
-
-
 
 void RadarLayer::updateCosts(
   nav2_costmap_2d::Costmap2D & master_grid,
@@ -310,195 +301,188 @@ void RadarLayer::populateGrid(
   }
 }
 
+
 void RadarLayer::predictiveCost(
   nav2_dynamic_msgs::msg::ObstacleArray::SharedPtr obstacle_array,
   int number_of_objects)
 {
-  // 좌표 변환 계수 계산
-  double dx, dy;
-  double x_x, x_y, y_x, y_y;
-  double inv_x_x, inv_x_y, inv_y_x, inv_y_y;
-
   auto clk = clock_->get_clock_type();
   rclcpp::Time stamp(obstacle_array->header.stamp, clk);
-  getTransformCoefficients(
-    global_frame_, obstacle_array->header.frame_id, stamp,
-    dx, dy, x_x, x_y, y_x, y_y, inv_x_x, inv_x_y, inv_y_x, inv_y_y);
 
-  const double eps = 1e-9; // 수치 안전 마진
+  // 지연 보정 → 너무 큰 값은 억제
+  double latency = (clock_->now() - stamp).seconds();
+  latency = std::clamp(latency, 0.0, 0.5);
+  const int latency_steps =
+      static_cast<int>(std::round(latency / std::max(0.01, sample_time_)));
+
+  const double eps = 1e-9;
+
+  // 좌표 변환 필요 여부(예측 모드에선 직접 처리)
+  const bool need_tf = (obstacle_array->header.frame_id != global_frame_);
+  double dx = 0, dy = 0, x_x = 1, x_y = 0, y_x = 0, y_y = 1;
+  double inv_x_x, inv_x_y, inv_y_x, inv_y_y; // 사용 안함(계산만 일관성 유지)
+  if (need_tf) {
+    getTransformCoefficients(
+      /*source_frame=*/global_frame_, /*target_frame=*/obstacle_array->header.frame_id,
+      stamp, dx, dy, x_x, x_y, y_x, y_y, inv_x_x, inv_x_y, inv_y_x, inv_y_y);
+  }
+
+  // 디버그 한번만
+  RCLCPP_INFO_ONCE(
+      logger_, "predictiveCost(): input frame=%s, global=%s",
+      obstacle_array->header.frame_id.c_str(), global_frame_.c_str());
 
   for (size_t i = 0; i < static_cast<size_t>(number_of_objects); i++) {
     nav2_dynamic_msgs::msg::Obstacle obstacle_0 = obstacle_array->obstacles[i];
 
-    // 초기 분산(크기 포함)으로부터 sqrt(2π det Σ0) 계산 + 가드
+    // 초기 분산(너무 작거나 나쁘면 skip)
     double cov0_x = obstacle_0.position_covariance[0] + std::max(0.0, obstacle_0.size.x / 2.0);
     double cov0_y = obstacle_0.position_covariance[4] + std::max(0.0, obstacle_0.size.y / 2.0);
-    cov0_x = (std::isfinite(cov0_x) && cov0_x > eps) ? cov0_x : eps;
-    cov0_y = (std::isfinite(cov0_y) && cov0_y > eps) ? cov0_y : eps;
+    cov0_x = std::clamp(cov0_x, eps, 10.0);
+    cov0_y = std::clamp(cov0_y, eps, 10.0);
 
     double sqrt_2_pi_det_covariance_0 = std::sqrt(2.0 * M_PI * cov0_x * cov0_y);
     if (!(std::isfinite(sqrt_2_pi_det_covariance_0) && sqrt_2_pi_det_covariance_0 > eps)) {
-      continue; // 이 오브젝트는 스킵
+      continue;
     }
 
-    // 수색 반경(그리드) 계산을 위한 예비 공분산 (horizon = number_of_time_steps_)
-    Eigen::Matrix2d covariance = projectCovariance(obstacle_0, sample_time_, number_of_time_steps_);
-    covariance(0, 0) += std::max(0.0, obstacle_0.size.x / 2.0);
-    covariance(1, 1) += std::max(0.0, obstacle_0.size.y / 2.0);
-    covariance(0, 0) = (std::isfinite(covariance(0, 0)) && covariance(0, 0) > eps) ? covariance(0, 0) : eps;
-    covariance(1, 1) = (std::isfinite(covariance(1, 1)) && covariance(1, 1) > eps) ? covariance(1, 1) : eps;
+    // 최대 예측 폭 기준 공분산(캐시 크기 산정용)
+    Eigen::Matrix2d covariance = projectCovariance(
+        obstacle_0, sample_time_, number_of_time_steps_ + latency_steps);
+    covariance(0, 0) = std::clamp(covariance(0, 0) + obstacle_0.size.x / 2.0, eps, 20.0);
+    covariance(1, 1) = std::clamp(covariance(1, 1) + obstacle_0.size.y / 2.0, eps, 20.0);
 
     Eigen::Matrix2d inv_covariance = Eigen::Matrix2d::Zero();
     inv_covariance(0, 0) = 1.0 / covariance(0, 0);
     inv_covariance(1, 1) = 1.0 / covariance(1, 1);
 
     double sqrt_2_pi_det_covariance =
-      std::sqrt(2.0 * M_PI * covariance(0, 0) * covariance(1, 1));
+        std::sqrt(2.0 * M_PI * covariance(0, 0) * covariance(1, 1));
     if (!(std::isfinite(sqrt_2_pi_det_covariance) && sqrt_2_pi_det_covariance > eps)) {
       continue;
     }
     double inv_sqrt_2_pi_det_covariance = 1.0 / sqrt_2_pi_det_covariance;
     double covariance_ratio = sqrt_2_pi_det_covariance_0 / sqrt_2_pi_det_covariance;
 
-    // sqrt 인자 음수/NaN 방지용 안전 계산
+    // 반경 계산 (문턱값)
     const double safe_min_prob = std::min(std::max(min_probability_, 1e-6), 0.999999);
-    const double safe_ratio    = std::max(covariance_ratio, eps);
-
+    const double safe_ratio = std::max(covariance_ratio, eps);
     auto axis_extent_m = [&](double cov_ii) -> double {
-      // 2D 가우시안 등확률선의 축 길이 계산 (확률 임계 기반)
       double inner = -2.0 * (std::log(safe_min_prob) - std::log(safe_ratio)) * cov_ii;
       if (!std::isfinite(inner) || inner <= 0.0) return 0.0;
       return 2.0 * std::sqrt(inner);
     };
-
     double length = axis_extent_m(covariance(0, 0));
     double width  = axis_extent_m(covariance(1, 1));
 
     int length_in_grid = static_cast<int>(std::floor(length / resolution_));
     int width_in_grid  = static_cast<int>(std::floor(width  / resolution_));
-
-    // 맵 크기 기반 반경 상한 클램프 (OOB/메모리 폭주 방지)
-    const int max_r = std::max(1, static_cast<int>(std::min(size_x_, size_y_) / 2) - 2);
-    auto clampi = [](int v, int lo, int hi) { return (v < lo ? lo : (v > hi ? hi : v)); };
-    length_in_grid = clampi(length_in_grid, 0, max_r);
-    width_in_grid  = clampi(width_in_grid,  0, max_r);
-
+    const int max_r = std::max(1, static_cast<int>(std::min(size_x_, size_y_) / 4) - 2);
+    length_in_grid = std::clamp(length_in_grid, 0, max_r);
+    width_in_grid  = std::clamp(width_in_grid,  0, max_r);
     mean_inflation_radius_ = std::max(length_in_grid, width_in_grid);
     int max_dist = generateIntegerDistances();
 
+    // 시간 전개
     for (int k = 0; k < number_of_time_steps_; ++k) {
       if (seen_.size() != size_x_ * size_y_) {
-        RCLCPP_WARN(logger_, "InflationLayer::updateCosts(): seen_ vector size is wrong");
         seen_ = std::vector<bool>(size_x_ * size_y_, false);
       }
       std::fill(begin(seen_), end(seen_), false);
 
-      // 평균/공분산 예측 + 안전화
+      // 예측된 평균 (여기선 '검출 위치'를 요구사항대로 그대로 사용)
       Eigen::Vector2d mean = projectMean(obstacle_0, sample_time_, k);
 
-      covariance = projectCovariance(obstacle_0, sample_time_, k);
-      covariance(0, 0) += std::max(0.0, obstacle_0.size.x / 2.0);
-      covariance(1, 1) += std::max(0.0, obstacle_0.size.y / 2.0);
-      covariance(0, 0) = (std::isfinite(covariance(0, 0)) && covariance(0, 0) > eps) ? covariance(0, 0) : eps;
-      covariance(1, 1) = (std::isfinite(covariance(1, 1)) && covariance(1, 1) > eps) ? covariance(1, 1) : eps;
+      // 필요시 2D 변환(검출 → global_frame_)
+      double mean_x = mean(0), mean_y = mean(1);
+      if (need_tf) {
+        const double tx = mean_x * x_x + mean_y * y_x + dx;
+        const double ty = mean_x * x_y + mean_y * y_y + dy;
+        mean_x = tx; mean_y = ty;
+      }
 
+      // 각 step의 공분산/캐시 갱신
+      covariance = projectCovariance(obstacle_0, sample_time_, k);
+      covariance(0, 0) = std::clamp(covariance(0, 0) + obstacle_0.size.x / 2.0, eps, 20.0);
+      covariance(1, 1) = std::clamp(covariance(1, 1) + obstacle_0.size.y / 2.0, eps, 20.0);
       inv_covariance(0, 0) = 1.0 / covariance(0, 0);
       inv_covariance(1, 1) = 1.0 / covariance(1, 1);
 
       sqrt_2_pi_det_covariance =
-        std::sqrt(2.0 * M_PI * covariance(0, 0) * covariance(1, 1));
+          std::sqrt(2.0 * M_PI * covariance(0, 0) * covariance(1, 1));
       if (!(std::isfinite(sqrt_2_pi_det_covariance) && sqrt_2_pi_det_covariance > eps)) {
         continue;
       }
       inv_sqrt_2_pi_det_covariance = 1.0 / sqrt_2_pi_det_covariance;
-      covariance_ratio = sqrt_2_pi_det_covariance_0 / sqrt_2_pi_det_covariance;
 
-      // 캐시 초기화/갱신
+      const double scaled_s0 =
+          sqrt_2_pi_det_covariance_0 * covariance_scaling_factor_;
+
       inflation_cells_.clear();
       inflation_cells_.resize(max_dist + 1);
-      computeCacheCosts(inv_covariance, inv_sqrt_2_pi_det_covariance, sqrt_2_pi_det_covariance_0);
+      computeCacheCosts(inv_covariance, inv_sqrt_2_pi_det_covariance, const_cast<double&>(sqrt_2_pi_det_covariance_0));
 
-      // mean 셀부터 시작
-      geometry_msgs::msg::PointStamped mean_in_global_frame;
-      mean_in_global_frame.header.stamp = obstacle_array->header.stamp;
-      mean_in_global_frame.header.frame_id = global_frame_;
-      mean_in_global_frame.point.x = mean(0) * x_x + mean(1) * y_x + dx;
-      mean_in_global_frame.point.y = mean(0) * x_y + mean(1) * y_y + dy;
-      mean_in_global_frame.point.z = 0;
-
-      auto & mean_bin = inflation_cells_[0];
-      mean_bin.reserve(200);
-      unsigned int mean_x_index, mean_y_index;
-      if (worldToMap(mean_in_global_frame.point.x, mean_in_global_frame.point.y,
-                     mean_x_index, mean_y_index)) {
-        unsigned int index0 = getIndex(mean_x_index, mean_y_index);
-        mean_bin.emplace_back(mean_x_index, mean_y_index, mean_x_index, mean_y_index);
+      // ── ★ 씨앗(검출 좌표) 강제 스탬프 ─────────────────────────────
+      unsigned int cx, cy;
+      if (!worldToMap(mean_x, mean_y, cx, cy)) {
+        RCLCPP_DEBUG(logger_, "worldToMap failed at (%.3f, %.3f) → skip", mean_x, mean_y);
+        continue;
       }
+      const unsigned int cidx = getIndex(cx, cy);
+      costmap_[cidx] = std::max<unsigned char>(costmap_[cidx], nav2_costmap_2d::LETHAL_OBSTACLE);
+
+      // 전파 시작점 큐에 넣기
+      auto & bin0 = inflation_cells_[0];
+      bin0.reserve(16);
+      bin0.emplace_back(cx, cy, cx, cy);
 
       const int r_guard = mean_inflation_radius_ + 2;
 
-      // 파급(인플레이션) 전파
-      int level = 0;
+      // ── 인플레이션 전파 ─────────────────────────────────────────
       for (auto & dist_bin : inflation_cells_) {
-        dist_bin.reserve(200);
-        level++;
-
         for (std::size_t idx = 0; idx < dist_bin.size(); ++idx) {
           const CellData & cell = dist_bin[idx];
-          unsigned int mx = cell.x_;
-          unsigned int my = cell.y_;
-          unsigned int sx = cell.src_x_;
-          unsigned int sy = cell.src_y_;
-          unsigned int map_index = getIndex(mx, my);
+          const unsigned int mx = cell.x_;
+          const unsigned int my = cell.y_;
+          const unsigned int sx = cell.src_x_;
+          const unsigned int sy = cell.src_y_;
+          const unsigned int map_index = getIndex(mx, my);
 
-          if (seen_[map_index]) {
-            continue;
-          }
+          if (seen_[map_index]) continue;
           seen_[map_index] = true;
 
-          int x_grid = static_cast<int>(mx) - static_cast<int>(sx);
-          int y_grid = static_cast<int>(my) - static_cast<int>(sy);
-
-          // 회전된 cost_matrix 인덱스(정수) 계산
-          int index_x = static_cast<int>(std::lround(std::abs(x_grid * inv_x_x + y_grid * inv_y_x)));
-          int index_y = static_cast<int>(std::lround(std::abs(x_grid * inv_x_y + y_grid * inv_y_y)));
-
-          // ▶ B: cost_matrix_ 접근 전 인덱스 가드 (OOB 방지)
-          if (index_x < 0 || index_y < 0 || index_x > r_guard || index_y > r_guard) {
-            continue;
-          }
-          // ▶ 분모 가드
-          if (!(std::isfinite(sqrt_2_pi_det_covariance_0) && sqrt_2_pi_det_covariance_0 > eps)) {
+          const int dxg = static_cast<int>(mx) - static_cast<int>(sx);
+          const int dyg = static_cast<int>(my) - static_cast<int>(sy);
+          if (std::abs(dxg) > r_guard || std::abs(dyg) > r_guard ||
+              (dxg*dxg + dyg*dyg > r_guard*r_guard)) {
             continue;
           }
 
-          unsigned char cost = cost_matrix_[index_x][index_y];
-          double prob = static_cast<double>(cost) / (252.0 * sqrt_2_pi_det_covariance_0);
-          if (prob > safe_min_prob) {
-            unsigned char old_cost = costmap_[map_index];
-            costmap_[map_index] = std::max(old_cost, cost);
+          const bool is_center = (mx == sx) && (my == sy);
 
-            // 이웃 전파
-            if (mx > 0) {
-              enqueue(map_index - 1, mx - 1, my, sx, sy);
-            }
-            if (my > 0) {
-              enqueue(map_index - size_x_, mx, my - 1, sx, sy);
-            }
-            if (mx < size_x_ - 1) {
-              enqueue(map_index + 1, mx + 1, my, sx, sy);
-            }
-            if (my < size_y_ - 1) {
-              enqueue(map_index + size_x_, mx, my + 1, sx, sy);
-            }
+          // 중심은 무조건 유지, 주변은 확률 문턱 적용
+          unsigned char cell_cost = is_center
+              ? nav2_costmap_2d::LETHAL_OBSTACLE
+              : cost_matrix_[std::abs(dxg)][std::abs(dyg)];
+          const double prob = is_center
+              ? 1.0
+              : static_cast<double>(cell_cost) / (252.0 * std::max(scaled_s0, eps));
+
+          if (is_center || prob > safe_min_prob) {
+            costmap_[map_index] = std::max(costmap_[map_index], cell_cost);
+            // 이웃 enqueue
+            if (mx > 0)           enqueue(map_index - 1,        mx - 1, my,     sx, sy);
+            if (my > 0)           enqueue(map_index - size_x_,  mx,     my - 1, sx, sy);
+            if (mx < size_x_ - 1) enqueue(map_index + 1,        mx + 1, my,     sx, sy);
+            if (my < size_y_ - 1) enqueue(map_index + size_x_,  mx,     my + 1, sx, sy);
           }
         }
-        // 메모리 즉시 회수
-        dist_bin = std::vector<CellData>();
+        dist_bin = std::vector<CellData>(); // 메모리 회수
       }
     }
   }
 }
+
 
 
 int RadarLayer::generateIntegerDistances()
@@ -1087,18 +1071,14 @@ Eigen::Vector2d RadarLayer::projectMean(
   int time_steps)
 {
   Eigen::VectorXd position(2);
-  Eigen::VectorXd velocity(2);
-  Eigen::VectorXd position_projected(2);
 
+  // costmap 시작점은 항상 디텍션된 위치에서 시작
   position(0) = obstacle.position.x;
   position(1) = obstacle.position.y;
-  velocity(0) = obstacle.velocity.x;
-  velocity(1) = obstacle.velocity.y;
 
-  position_projected = position + time_steps * sample_time * velocity;
-
-  return position_projected;
+  return position;
 }
+
 
 Eigen::Matrix2d RadarLayer::projectCovariance(
   nav2_dynamic_msgs::msg::Obstacle obstacle,
@@ -1140,6 +1120,196 @@ rmw_time_t RadarLayer::convertHzToRmwTimeS(double qos_deadline_hz)
 
   return rmw_time;
 }
+
+
+// 검출(Detection)을 씨앗으로 사용하고, 각 시간 스텝마다
+// 공분산 + 최소확률 문턱으로 퍼짐 반경을 산정하여 전파.
+// (이 함수가 생성하는 이방 퍼짐은 레이어 목록의 "마지막"에서 MAX로 얹힌다.)
+void RadarLayer::predictiveCostSeeded(
+  nav2_dynamic_msgs::msg::ObstacleArray::SharedPtr obstacles,     // tracking
+  nav2_dynamic_msgs::msg::ObstacleArray::SharedPtr detections,    // detections (seed)
+  int number_of_objects)
+{
+  const auto ctype = clock_->get_clock_type();
+  const rclcpp::Time obs_stamp(obstacles->header.stamp, ctype);
+  const double eps = 1e-9;
+
+  // ── 검출 UUID → seed point (검출 좌표, 검출 시각)
+  struct Seed { geometry_msgs::msg::Point p; rclcpp::Time st; };
+  std::unordered_map<std::string, Seed> seed_map;
+  if (detections) {
+    const rclcpp::Time det_stamp(detections->header.stamp, ctype);
+    for (const auto& d : detections->obstacles) {
+      const std::string key(reinterpret_cast<const char*>(d.uuid.uuid.data()), d.uuid.uuid.size());
+      seed_map[key] = Seed{d.position, det_stamp};
+    }
+  }
+
+  // ── 프레임 변환 계수 준비 (source → global_frame_)
+  auto make_tf = [&](const std::string& src_frame,
+                     double& dx,double&dy,double& x_x,double&x_y,double& y_x,double& y_y){
+    double inv_x_x, inv_x_y, inv_y_x, inv_y_y;
+    if (src_frame != global_frame_) {
+      getTransformCoefficients(
+        /*source_frame=*/global_frame_, /*target_frame=*/src_frame, obs_stamp,
+        dx, dy, x_x, x_y, y_x, y_y, inv_x_x, inv_x_y, inv_y_x, inv_y_y);
+      return true;
+    }
+    dx=dy=0.0; x_x=1.0; x_y=0.0; y_x=0.0; y_y=1.0; return false;
+  };
+
+  double odx, ody, oxx, oxy, oyx, oyy;  // obstacles frame → map
+  make_tf(obstacles->header.frame_id, odx, ody, oxx, oxy, oyx, oyy);
+
+  double ddx, ddy, dxx, dxy, dyx, dyy;  // detections frame → map
+  if (detections) make_tf(detections->header.frame_id, ddx, ddy, dxx, dxy, dyx, dyy);
+  else            { ddx=ddy=0; dxx=1; dxy=0; dyx=0; dyy=1; }
+
+  // ── 객체 루프
+  for (int i = 0; i < number_of_objects; ++i) {
+    nav2_dynamic_msgs::msg::Obstacle ob = obstacles->obstacles[i];
+
+    // 1) seed 결정 (검출 우선, 없으면 tracking 좌표)
+    const std::string key(reinterpret_cast<const char*>(ob.uuid.uuid.data()), ob.uuid.uuid.size());
+    double seed_x, seed_y; // map 좌표
+    if (auto it = seed_map.find(key); it != seed_map.end()) {
+      const double sx = it->second.p.x, sy = it->second.p.y;
+      seed_x = sx * dxx + sy * dyx + ddx;
+      seed_y = sx * dxy + sy * dyy + ddy;
+    } else {
+      const double ox = ob.position.x, oy = ob.position.y;
+      seed_x = ox * oxx + oy * oyx + odx;
+      seed_y = ox * oxy + oy * oyy + ody;
+    }
+
+    // 2) 초기 공분산/스케일(확률 정규화 항)
+    double cov0_x = std::clamp(ob.position_covariance[0] + std::max(0.0, ob.size.x / 2.0), eps, 10.0);
+    double cov0_y = std::clamp(ob.position_covariance[4] + std::max(0.0, ob.size.y / 2.0), eps, 10.0);
+    double s0 = std::sqrt(2.0 * M_PI * cov0_x * cov0_y);
+    if (!(std::isfinite(s0) && s0 > eps)) continue;
+    const double s0_scaled = s0 * covariance_scaling_factor_;
+    const double p_min = std::min(std::max(min_probability_, 1e-6), 0.999999);
+
+    // 3) k=0에서 물체 크기 직사각형 스탬핑(축 정렬)
+    auto stamp_box_map = [&](double cx, double cy, double L, double W) {
+      const double hx = std::max(0.0, L * 0.5);
+      const double hy = std::max(0.0, W * 0.5);
+      for (double x = cx - hx; x <= cx + hx; x += resolution_) {
+        for (double y = cy - hy; y <= cy + hy; y += resolution_) {
+          unsigned int mx, my;
+          if (worldToMap(x, y, mx, my)) {
+            const unsigned int idx = getIndex(mx, my);
+            costmap_[idx] = std::max<unsigned char>(costmap_[idx], nav2_costmap_2d::LETHAL_OBSTACLE);
+          }
+        }
+      }
+    };
+
+    // 4) 시간 전개
+    for (int k = 0; k < number_of_time_steps_; ++k) {
+      // (a) 스텝별 평균 위치 (seed 기준 + v*dt*k)
+      double mean_x = seed_x + ob.velocity.x * sample_time_ * k;
+      double mean_y = seed_y + ob.velocity.y * sample_time_ * k;
+
+      // k=0일 때 LETHAL + 직사각형 스탬프(물체 크기 보장)
+      if (k == 0) {
+        unsigned int cx0, cy0;
+        if (worldToMap(mean_x, mean_y, cx0, cy0)) {
+          const unsigned int cidx0 = getIndex(cx0, cy0);
+          costmap_[cidx0] = std::max<unsigned char>(costmap_[cidx0], nav2_costmap_2d::LETHAL_OBSTACLE);
+        }
+        stamp_box_map(mean_x, mean_y, ob.size.x, ob.size.y);
+      }
+
+      // (b) 공분산 갱신 및 반경 산정
+      Eigen::Matrix2d cov = projectCovariance(ob, sample_time_, k);
+      cov(0,0) = std::clamp(cov(0,0) + ob.size.x / 2.0, eps, 20.0);
+      cov(1,1) = std::clamp(cov(1,1) + ob.size.y / 2.0, eps, 20.0);
+
+      Eigen::Matrix2d inv_cov = Eigen::Matrix2d::Zero();
+      inv_cov(0,0) = 1.0 / cov(0,0);
+      inv_cov(1,1) = 1.0 / cov(1,1);
+
+      double s = std::sqrt(2.0 * M_PI * cov(0,0) * cov(1,1));
+      if (!(std::isfinite(s) && s > eps)) continue;
+      double inv_s = 1.0 / s;
+      double ratio = s0 / std::max(s, 1e-9);
+
+      // 축 방향 지름(미터) → 셀 반경으로
+      double Lm = axis_extent_m(cov(0,0), p_min, ratio);
+      double Wm = axis_extent_m(cov(1,1), p_min, ratio);
+      int radius_cells = static_cast<int>(std::floor(std::max(Lm, Wm) / std::max(1e-6, resolution_)));
+      radius_cells = std::max(radius_cells, 1);
+
+      // 물체 크기(반지름) 이상 보장
+      int min_by_size = static_cast<int>(
+        std::ceil(0.5 * std::max(ob.size.x, ob.size.y) / std::max(1e-6, resolution_))
+      ) + 1;
+      mean_inflation_radius_ = std::max(radius_cells, min_by_size);
+
+      // 거리/코스트 캐시 재생성
+      int max_dist = generateIntegerDistances();
+      inflation_cells_.clear();
+      inflation_cells_.resize(max_dist + 1);
+      computeCacheCosts(inv_cov, inv_s, s0);
+
+      // (c) 중심 셀에서 BFS 전파
+      unsigned int cx, cy;
+      if (!worldToMap(mean_x, mean_y, cx, cy)) continue;
+      const unsigned int cidx = getIndex(cx, cy);
+      costmap_[cidx] = std::max<unsigned char>(costmap_[cidx], nav2_costmap_2d::LETHAL_OBSTACLE);
+
+      auto& bin0 = inflation_cells_[0];
+      bin0.clear();
+      bin0.emplace_back(cx, cy, cx, cy);
+
+      const int r_guard = mean_inflation_radius_ + 2;
+
+      if (seen_.size() != size_x_ * size_y_) seen_.assign(size_x_ * size_y_, false);
+      std::fill(seen_.begin(), seen_.end(), false);
+
+      for (auto& dist_bin : inflation_cells_) {
+        for (size_t idx = 0; idx < dist_bin.size(); ++idx) {
+          const CellData& cell = dist_bin[idx];
+          const unsigned int mx = cell.x_;
+          const unsigned int my = cell.y_;
+          const unsigned int sx = cell.src_x_;
+          const unsigned int sy = cell.src_y_;
+          const unsigned int mindex = getIndex(mx, my);
+
+          if (seen_[mindex]) continue;
+          seen_[mindex] = true;
+
+          const int dx = static_cast<int>(mx) - static_cast<int>(sx);
+          const int dy = static_cast<int>(my) - static_cast<int>(sy);
+          if (std::abs(dx) > r_guard || std::abs(dy) > r_guard || (dx*dx + dy*dy > r_guard*r_guard))
+            continue;
+
+          const bool center = (mx == sx && my == sy);
+          unsigned char cost = center ? nav2_costmap_2d::LETHAL_OBSTACLE
+                                      : cost_matrix_[std::abs(dx)][std::abs(dy)];
+          const double prob = center ? 1.0 : static_cast<double>(cost) / (252.0 * std::max(s0_scaled, eps));
+
+          if (center || prob > p_min) {
+            costmap_[mindex] = std::max(costmap_[mindex], cost);
+            if (mx > 0)           enqueue(mindex - 1,        mx - 1, my,     sx, sy);
+            if (my > 0)           enqueue(mindex - size_x_,  mx,     my - 1, sx, sy);
+            if (mx < size_x_-1)   enqueue(mindex + 1,        mx + 1, my,     sx, sy);
+            if (my < size_y_-1)   enqueue(mindex + size_x_,  mx,     my + 1, sx, sy);
+          }
+        }
+        dist_bin = std::vector<CellData>(); // 메모리 반환
+      }
+
+      // (선택) 디버그 로그
+      RCLCPP_DEBUG(logger_,
+        "[radar infl] k=%d radius=%d (~%.2fm) p_min=%.3f cov=(%.3f,%.3f) s0=%.3f scale=%.2f",
+        k, mean_inflation_radius_, mean_inflation_radius_ * resolution_,
+        p_min, cov(0,0), cov(1,1), s0, covariance_scaling_factor_);
+    }
+  }
+}
+
 
 } // namespace radar_layer
 
